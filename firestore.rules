@@ -1,0 +1,245 @@
+rules_version = '2';
+
+// ============================================================
+// EverythingMax.org — Firestore Security Rules
+// ------------------------------------------------------------
+// Schema this matches:
+//   /users/{uid}                     — one doc per account
+//   /threads/{threadId}              — one doc per thread
+//   /threads/{threadId}/replies/{id} — replies subcollection
+//
+// Rules summary:
+//   - users: public read (profile pages are viewable while logged
+//     out). A user can create their OWN doc once at signup. A user
+//     can update their OWN bio/pfpUrl, OWN rankColor, and OWN
+//     deactivated/deactivatedAt (account deactivation — content
+//     stays, profile becomes unlookupable). ANY signed-in user may
+//     bump ANOTHER user's reputation field ONLY (this is what
+//     happens when someone likes a thread/reply). readyAtMs,
+//     username, usernameLower, createdAt* are never client-editable
+//     after creation.
+//   - threads: anyone (even logged out) can read, so the forums
+//     are browsable without an account. Only signed-in users can
+//     create a thread, and only as themselves. Reply-count/like-count
+//     bumps are allowed from any signed-in user (narrow field allowlist).
+//     Scheduling/cancelling deletion (deleteScheduledAt) is restricted
+//     to the thread's OWN author only.
+//   - replies: same pattern — public read, signed-in create as
+//     yourself, narrow update allowance for likeCount (anyone) and
+//     deleteScheduledAt (author only).
+// ============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Users ----------
+    match /users/{userId} {
+      allow read: if true; // public profile pages, viewable while logged out
+
+      // Allow creating your OWN user doc once, at signup.
+      allow create: if request.auth != null
+                    && request.auth.uid == userId
+                    && request.resource.data.username is string
+                    && request.resource.data.readyAtMs is number;
+
+      // Self-editing your OWN bio/pfpUrl (Edit Profile page).
+      allow update: if request.auth != null
+                    && request.auth.uid == userId
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                       .hasOnly(['bio', 'pfpUrl']);
+
+      // Self-editing your OWN rank glow/particle color choice.
+      allow update: if request.auth != null
+                    && request.auth.uid == userId
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                       .hasOnly(['rankColor']);
+
+      // Self-deactivating your OWN account (content stays, profile
+      // becomes unlookupable). Only allowed to set deactivated to
+      // true, not back to false (deactivation is one-way from the
+      // client; reactivation would need a manual/support process).
+      allow update: if request.auth != null
+                    && request.auth.uid == userId
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                       .hasOnly(['deactivated', 'deactivatedAt'])
+                    && request.resource.data.deactivated == true;
+
+      // ANY signed-in user may bump ANOTHER user's reputation by
+      // exactly +1 or -1 (liking / unliking their thread or reply),
+      // touching ONLY that field. Uses resource.data.get('reputation', 0)
+      // rather than `== null`, since accessing a field that doesn't
+      // exist at all on an older account throws an evaluation error
+      // instead of returning null — get() safely defaults it to 0.
+      allow update: if request.auth != null
+                    && request.auth.uid != userId
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                       .hasOnly(['reputation'])
+                    && (
+                         request.resource.data.reputation
+                           == resource.data.get('reputation', 0) + 1
+                         || request.resource.data.reputation
+                           == resource.data.get('reputation', 0) - 1
+                       );
+
+      // Self-updating your OWN postCount by exactly +1 per post (called
+      // from incrementPostCount() whenever you create a thread/reply).
+      // May ALSO touch reputation in the same write, but only upward by
+      // exactly +1 — this is the "+1 rep every 2 posts" bonus, which
+      // the client only includes on even postCount values. Uses
+      // resource.data.get(field, default) rather than `== null`, since
+      // accessing a field that was never written on an older account
+      // (no postCount/reputation field at all) throws an evaluation
+      // error rather than returning null — get() is the safe way to
+      // default a possibly-missing field.
+      allow update: if request.auth != null
+                    && request.auth.uid == userId
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                       .hasOnly(['postCount', 'reputation'])
+                    && request.resource.data.postCount
+                       == resource.data.get('postCount', 0) + 1
+                    && (
+                         !request.resource.data.diff(resource.data).affectedKeys().hasAny(['reputation'])
+                         || request.resource.data.reputation
+                            == resource.data.get('reputation', 0) + 1
+                       );
+
+      // Self-granting VIP status, after returning from the Stripe
+      // Payment Link success redirect (see vip-success-page.js).
+      // This is an honor-system check (no server-side payment
+      // verification yet), so it only allows setting isVip to true —
+      // never used to "prove" a refund or removal from the client.
+      allow update: if request.auth != null
+                    && request.auth.uid == userId
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                       .hasOnly(['isVip', 'vipGrantedAt'])
+                    && request.resource.data.isVip == true;
+
+      allow delete: if false;
+    }
+
+    // ---------- Threads ----------
+    match /threads/{threadId} {
+      allow read: if true; // public forums, browsable while logged out
+
+      allow create: if request.auth != null
+                    && request.resource.data.authorUid == request.auth.uid
+                    && request.resource.data.title is string
+                    && request.resource.data.description is string
+                    && request.resource.data.category is string;
+
+      // Allow the reply-count bump from addReply(), and the like-count
+      // bump from likeThread() — restrict to ONLY those fields so a
+      // signed-in user can't rewrite someone else's thread title/body.
+      allow update: if request.auth != null
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                       .hasOnly(['replyCount', 'lastReplyAt', 'lastReplyAuthor', 'lastReplyAuthorUid', 'likeCount']);
+
+      // Scheduling/cancelling deletion — author only, touching ONLY
+      // deleteScheduledAt. This is what powers the "delete with a
+      // 24-hour undo window" feature.
+      allow update: if request.auth != null
+                    && resource.data.authorUid == request.auth.uid
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                       .hasOnly(['deleteScheduledAt']);
+
+      // VIP perk: a VIP account may schedule/cancel deletion of ANY
+      // thread, not just their own — checked via a get() against the
+      // VIP's own user doc (isVip == true).
+      allow update: if request.auth != null
+                    && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isVip == true
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                       .hasOnly(['deleteScheduledAt']);
+
+      allow delete: if false;
+
+      // ---------- Likes (subcollection) — one per user, doc ID == their uid ----------
+      // Existence of /threads/{id}/likes/{uid} means that uid has liked
+      // this thread. Only the liker themselves may create or delete
+      // their own like doc (toggling), enforced by the doc ID matching
+      // their auth uid. This is what makes "one like per person" work —
+      // a second "like" attempt is just a delete of the same doc.
+      match /likes/{likeUid} {
+        allow read: if true;
+        allow create: if request.auth != null && request.auth.uid == likeUid;
+        allow delete: if request.auth != null && request.auth.uid == likeUid;
+        allow update: if false;
+      }
+
+      // ---------- Replies (subcollection) ----------
+      match /replies/{replyId} {
+        allow read: if true;
+
+        allow create: if request.auth != null
+                      && request.resource.data.authorUid == request.auth.uid
+                      && request.resource.data.body is string;
+
+        // Allow the like-count bump from likeReply() — anyone signed in.
+        allow update: if request.auth != null
+                      && request.resource.data.diff(resource.data).affectedKeys()
+                         .hasOnly(['likeCount']);
+
+        // Scheduling/cancelling deletion — author only.
+        allow update: if request.auth != null
+                      && resource.data.authorUid == request.auth.uid
+                      && request.resource.data.diff(resource.data).affectedKeys()
+                         .hasOnly(['deleteScheduledAt']);
+
+        // VIP perk: a VIP account may schedule/cancel deletion of
+        // ANY reply, not just their own.
+        allow update: if request.auth != null
+                      && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isVip == true
+                      && request.resource.data.diff(resource.data).affectedKeys()
+                         .hasOnly(['deleteScheduledAt']);
+
+        allow delete: if false;
+
+        // ---------- Likes (subcollection) — same one-per-person pattern ----------
+        match /likes/{likeUid} {
+          allow read: if true;
+          allow create: if request.auth != null && request.auth.uid == likeUid;
+          allow delete: if request.auth != null && request.auth.uid == likeUid;
+          allow update: if false;
+        }
+      }
+    }
+
+    // ---------- Private messaging ----------
+    // Conversation doc IDs are deterministic: both participant uids
+    // sorted and joined with "_" (see conversationIdFor() client-side).
+    // Only the two people IN a conversation may read or write it —
+    // unlike threads/replies/profiles, DMs are never publicly visible.
+    match /conversations/{conversationId} {
+      allow read: if request.auth != null
+                  && request.auth.uid in resource.data.participants;
+
+      // Creating a conversation: caller must be one of the two listed
+      // participants, and the document must list exactly them.
+      allow create: if request.auth != null
+                    && request.auth.uid in request.resource.data.participants
+                    && request.resource.data.participants.size() == 2;
+
+      // Updating the "last message" preview fields — caller must
+      // already be a participant, and only those summary fields
+      // may change (the participant list itself is immutable).
+      allow update: if request.auth != null
+                    && request.auth.uid in resource.data.participants
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                       .hasOnly(['lastMessageAt', 'lastMessageText', 'lastMessageSenderUid']);
+
+      allow delete: if false;
+
+      // ---------- Messages (subcollection) ----------
+      match /messages/{messageId} {
+        allow read: if request.auth != null
+                    && request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants;
+
+        allow create: if request.auth != null
+                      && request.auth.uid == request.resource.data.senderUid
+                      && request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants
+                      && request.resource.data.text is string;
+
+        allow update, delete: if false;
+      }
+    }
+  }
+}
