@@ -120,13 +120,17 @@ async function sendMessage(otherUid, otherUsername, senderUid, senderUsername, t
 async function getConversationsForUser(uid) {
   if (!uid) return { ok: false, error: "Not logged in.", conversations: [] };
   try {
-    const q = query(
-      collection(db, "conversations"),
-      where("participants", "array-contains", uid),
-      orderBy("lastMessageAt", "desc")
-    );
+    // Note: deliberately NOT combining orderBy with array-contains here —
+    // that pairing requires a manually-created composite index in
+    // Firestore, and until that index exists the query is rejected
+    // (sometimes surfaced as a confusing "permission-denied" error
+    // rather than a clear "missing index" one). Sorting client-side
+    // avoids needing that index at all.
+    const q = query(collection(db, "conversations"), where("participants", "array-contains", uid));
     const snap = await getDocs(q);
-    const conversations = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    const conversations = snap.docs
+      .map((d) => ({ id: d.id, ...d.data() }))
+      .sort((a, b) => (b.lastMessageAt || 0) - (a.lastMessageAt || 0));
     return { ok: true, conversations };
   } catch (e) {
     console.error("getConversationsForUser failed", e);
